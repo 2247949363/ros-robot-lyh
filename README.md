@@ -4,7 +4,7 @@ ROS 机器人 STM32 下位机固件。
 
 ## Hardware
 
-- MCU: STM32F103
+- MCU: STM32F103RCT6
 - IDE: Keil MDK
 - RTOS: FreeRTOS
 
