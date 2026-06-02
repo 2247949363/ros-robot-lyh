@@ -1,0 +1,22 @@
+# Keil build output
+Objects/
+Listings/
+
+# Keil generated or user-specific files
+DebugConfig/
+*.uvguix.*
+*.uvoptx
+
+# Local VS Code configuration
+.vscode/
+
+# Temporary build artifacts
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.map
+*.lst
+*.log
+*.lock
