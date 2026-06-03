@@ -23,6 +23,11 @@
 #define MOTOR_REDUCTION_RATIO   74.8f
 #define PI_F                    3.1416f
 
+#define SPEED_FILTER_LOW_THRESHOLD_MMPS 180.0f
+#define SPEED_FILTER_LOW_ALPHA          0.25f
+#define SPEED_FILTER_HIGH_ALPHA         0.65f
+#define SPEED_FILTER_ZERO_THRESHOLD_MMPS 1.0f
+
 #define CONTROL_TASK_PRIORITY   5U
 #define ROS_RX_TASK_PRIORITY    4U
 #define SAFETY_TASK_PRIORITY    4U
@@ -51,6 +56,9 @@ static QueueHandle_t s_rosRxQueue;
 static volatile TickType_t s_lastRosCmdTick;
 static volatile uint8_t s_rosTimeout;
 static volatile AppCmdSource s_cmdSource = APP_CMD_SOURCE_NONE;
+static float s_filteredWheelSpeed1;
+static float s_filteredWheelSpeed2;
+static float s_filteredWheelSpeed3;
 
 static void ControlTask(void *argument);
 static void RosRxTask(void *argument);
@@ -58,6 +66,9 @@ static void RosTxTask(void *argument);
 static void DisplayTask(void *argument);
 static void SafetyTask(void *argument);
 static float EncoderCountToSpeedMmps(int16_t count, float sampleTimeSec);
+static float AbsFloat(float value);
+static float WheelSpeedFilterUpdate(float filteredSpeed, float rawSpeed, float targetSpeed);
+static void WheelSpeedFilterReset(void);
 static void MotorStopAndResetPid(void);
 
 void App_CreateTasks(void)
@@ -112,6 +123,9 @@ static void ControlTask(void *argument)
         float vxTarget;
         float vyTarget;
         float wzTarget;
+        float rawSpeed1;
+        float rawSpeed2;
+        float rawSpeed3;
         uint8_t stopNow;
 
         vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(CONTROL_PERIOD_MS));
@@ -120,11 +134,9 @@ static void ControlTask(void *argument)
         speed_capture2 = TIM3_Encoder_Get();
         speed_capture3 = TIM4_Encoder_Get();
 
-        speed_actual1 = EncoderCountToSpeedMmps((int16_t)speed_capture1, CONTROL_PERIOD_MS / 1000.0f);
-        speed_actual2 = EncoderCountToSpeedMmps((int16_t)speed_capture2, CONTROL_PERIOD_MS / 1000.0f);
-        speed_actual3 = EncoderCountToSpeedMmps((int16_t)speed_capture3, CONTROL_PERIOD_MS / 1000.0f);
-
-        Speed_cal(speed_actual1, speed_actual2, speed_actual3);
+        rawSpeed1 = EncoderCountToSpeedMmps((int16_t)speed_capture1, CONTROL_PERIOD_MS / 1000.0f);
+        rawSpeed2 = EncoderCountToSpeedMmps((int16_t)speed_capture2, CONTROL_PERIOD_MS / 1000.0f);
+        rawSpeed3 = EncoderCountToSpeedMmps((int16_t)speed_capture3, CONTROL_PERIOD_MS / 1000.0f);
 
         taskENTER_CRITICAL();
         if (flag == 1)
@@ -156,6 +168,16 @@ static void ControlTask(void *argument)
         }
 
         Speed_Target(vxTarget, vyTarget, wzTarget);
+
+        s_filteredWheelSpeed1 = WheelSpeedFilterUpdate(s_filteredWheelSpeed1, rawSpeed1, v1_jisuan);
+        s_filteredWheelSpeed2 = WheelSpeedFilterUpdate(s_filteredWheelSpeed2, rawSpeed2, v2_jisuan);
+        s_filteredWheelSpeed3 = WheelSpeedFilterUpdate(s_filteredWheelSpeed3, rawSpeed3, v3_jisuan);
+
+        speed_actual1 = s_filteredWheelSpeed1;
+        speed_actual2 = s_filteredWheelSpeed2;
+        speed_actual3 = s_filteredWheelSpeed3;
+
+        Speed_cal(speed_actual1, speed_actual2, speed_actual3);
 
         PID_Calc(&mypid1, v1_jisuan, speed_actual1);
         KeyNum1 = (int)mypid1.output;
@@ -304,6 +326,44 @@ static float EncoderCountToSpeedMmps(int16_t count, float sampleTimeSec)
     return ((float)count / sampleTimeSec) / countsPerRev * wheelCircumferenceM * 1000.0f;
 }
 
+static float AbsFloat(float value)
+{
+    return (value >= 0.0f) ? value : -value;
+}
+
+static float WheelSpeedFilterUpdate(float filteredSpeed, float rawSpeed, float targetSpeed)
+{
+    float rawAbs = AbsFloat(rawSpeed);
+    float targetAbs = AbsFloat(targetSpeed);
+    float alpha = SPEED_FILTER_HIGH_ALPHA;
+
+    if ((rawAbs < SPEED_FILTER_ZERO_THRESHOLD_MMPS) &&
+        (targetAbs < SPEED_FILTER_ZERO_THRESHOLD_MMPS))
+    {
+        return 0.0f;
+    }
+
+    if ((rawAbs < SPEED_FILTER_LOW_THRESHOLD_MMPS) &&
+        (targetAbs < SPEED_FILTER_LOW_THRESHOLD_MMPS))
+    {
+        alpha = SPEED_FILTER_LOW_ALPHA;
+    }
+
+    return filteredSpeed + alpha * (rawSpeed - filteredSpeed);
+}
+
+static void WheelSpeedFilterReset(void)
+{
+    s_filteredWheelSpeed1 = 0.0f;
+    s_filteredWheelSpeed2 = 0.0f;
+    s_filteredWheelSpeed3 = 0.0f;
+
+    speed_actual1 = 0.0f;
+    speed_actual2 = 0.0f;
+    speed_actual3 = 0.0f;
+    Speed_cal(0.0f, 0.0f, 0.0f);
+}
+
 static void MotorStopAndResetPid(void)
 {
     motor_Set1(0);
@@ -317,4 +377,6 @@ static void MotorStopAndResetPid(void)
     PID_Reset(&mypid1);
     PID_Reset(&mypid2);
     PID_Reset(&mypid3);
+
+    WheelSpeedFilterReset();
 }
