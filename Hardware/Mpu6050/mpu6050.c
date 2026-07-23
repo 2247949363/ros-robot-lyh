@@ -1,162 +1,193 @@
-#include "MPU6050.h"
+#include "mpu6050.h"
+#include "delay.h"
 
-u8 mpu6050_write(u8 addr, u8 reg, u8 len, u8* buf)//返回值 0：读成功  -1：读失败
-{ 
-		 unsigned char i;
-     addr=addr<<1;                     //注意dma库地址不包含最后一位，需要移位
-		 MPU6050_IIC_Start();              //启动总线
-		 MPU6050_IIC_Send_Byte(addr);      //发送器件地址           
-		 MPU6050_IIC_Send_Byte(reg);       //发送器件子地址
+u8 mpu6050_write(u8 addr, u8 reg, u8 len, u8 *buf)
+{
+    u8 i;
+    u8 busAddress = (u8)(addr << 1);
 
-		 for(i=0;i<len;i++)            
-			 MPU6050_IIC_Send_Byte(*buf++);  //发送数据
-		 MPU6050_IIC_Stop();               //结束总线
+    if ((buf == 0) || (len == 0U)) return 1U;
 
-		 return 0;
+    MPU6050_IIC_Start();
+    if (MPU6050_IIC_Send_Byte(busAddress) != 0U) return 1U;
+    if (MPU6050_IIC_Send_Byte(reg) != 0U) return 1U;
+
+    for (i = 0U; i < len; i++)
+    {
+        if (MPU6050_IIC_Send_Byte(buf[i]) != 0U) return 1U;
+    }
+
+    MPU6050_IIC_Stop();
+    return 0U;
 }
 
-u8 mpu6050_read(u8 addr, u8 reg, u8 len, u8 *buf)//返回值 0：读成功  -1：读失败
+u8 mpu6050_read(u8 addr, u8 reg, u8 len, u8 *buf)
 {
-		 unsigned char i;
-     addr=addr<<1;                     //注意dma库地址不包含最后一位，需要移位
-		 MPU6050_IIC_Start();              //启动总线           
-		 MPU6050_IIC_Send_Byte(addr);      //发送器件地址            
-		 MPU6050_IIC_Send_Byte(reg);       //发送器件子地址
+    u8 i;
+    u8 busAddress = (u8)(addr << 1);
 
-		 MPU6050_IIC_Start();              //重新启动总线
-		 MPU6050_IIC_Send_Byte(addr+1);
-		 for(i=0;i<len-1;i++)  
-			 *buf++=MPU6050_IIC_Read_Byte(0);//发送数据
-		 *buf=MPU6050_IIC_Read_Byte(1);
-		 MPU6050_IIC_Stop();               //结束总线
-	
-		 return 0;
+    if ((buf == 0) || (len == 0U)) return 1U;
+
+    MPU6050_IIC_Start();
+    if (MPU6050_IIC_Send_Byte(busAddress) != 0U) return 1U;
+    if (MPU6050_IIC_Send_Byte(reg) != 0U) return 1U;
+
+    MPU6050_IIC_Start();
+    if (MPU6050_IIC_Send_Byte((u8)(busAddress + 1U)) != 0U) return 1U;
+
+    for (i = 0U; i < (u8)(len - 1U); i++)
+    {
+        buf[i] = MPU6050_IIC_Read_Byte(0U);
+    }
+    buf[len - 1U] = MPU6050_IIC_Read_Byte(1U);
+    MPU6050_IIC_Stop();
+    return 0U;
 }
 
 void mpu6050_write_reg(u8 reg, u8 dat)
 {
-   mpu6050_write(MPU_ADDR,reg,1,&dat);
+    (void)mpu6050_write(MPU_ADDR, reg, 1U, &dat);
 }
 
-u8   mpu6050_read_reg (u8 reg)
+u8 mpu6050_read_reg(u8 reg)
 {
-	 u8 dat;
-   mpu6050_read(MPU_ADDR,reg,1,&dat);
-	 return dat;
+    u8 dat = 0xFFU;
+    (void)mpu6050_read(MPU_ADDR, reg, 1U, &dat);
+    return dat;
 }
 
-//设置MPU6050陀螺仪传感器满量程范围
-//fsr:0,±250dps;1,±500dps;2,±1000dps;3,±2000dps
-//返回值:0,设置成功
-//    其他,设置失败 
 u8 MPU_Set_Gyro_Fsr(u8 fsr)
 {
-	mpu6050_write_reg(GYRO_CONFIG,fsr<<3);//设置陀螺仪满量程范围  
-	return 0;
-}
-//设置MPU6050加速度传感器满量程范围
-//fsr:0,±2g;1,±4g;2,±8g;3,±16g
-//返回值:0,设置成功
-//    其他,设置失败 
-u8 MPU_Set_Accel_Fsr(u8 fsr)
-{
-	mpu6050_write_reg(ACCEL_CONFIG,fsr<<3);//设置加速度传感器满量程范围  
-	return 0;
-}
-//设置MPU6050的数字低通滤波器
-//lpf:数字低通滤波频率(Hz)
-//返回值:0,设置成功
-//    其他,设置失败 
-u8 MPU_Set_LPF(u16 lpf)
-{
-	u8 data=0;
-	if(lpf>=188)data=1;
-	else if(lpf>=98)data=2;
-	else if(lpf>=42)data=3;
-	else if(lpf>=20)data=4;
-	else if(lpf>=10)data=5;
-	else data=6; 
-	mpu6050_write_reg(MPU_CFG_REG,data);//设置数字低通滤波器  
-	return 0;
-}
-//设置MPU6050的采样率(假定Fs=1KHz)
-//rate:4~1000(Hz)
-//返回值:0,设置成功
-//    其他,设置失败 
-u8 MPU_Set_Rate(u16 rate)
-{
-	u8 data;
-	if(rate>1000)rate=1000;
-	if(rate<4)rate=4;
-	data=1000/rate-1;
-	mpu6050_write_reg(MPU_SAMPLE_RATE_REG,data);	//设置数字低通滤波器
- 	return MPU_Set_LPF(rate/2);	//自动设置LPF为采样率的一半
+    u8 value = (u8)(fsr << 3);
+    return mpu6050_write(MPU_ADDR, GYRO_CONFIG, 1U, &value);
 }
 
-void MPU6050_Init(void)
-{ 
-	u8 res; 
-	MPU6050_IIC_IO_Init(); //初始化IIC总线
-	mpu6050_write_reg(PWR_MGMT_1,0X80);	//复位MPU6050
-    delay_ms(100);
-	mpu6050_write_reg(PWR_MGMT_1,0X00);	//唤醒MPU6050 
-	MPU_Set_Gyro_Fsr(3);					//陀螺仪传感器,±2000dps
-	MPU_Set_Accel_Fsr(0);					//加速度传感器,±2g
-	MPU_Set_Rate(200);						//设置采样率50Hz
-	mpu6050_write_reg(MPU_INT_EN_REG,0X00);	//关闭所有中断
-	mpu6050_write_reg(MPU_USER_CTRL_REG,0X00);	//I2C主模式关闭
-	mpu6050_write_reg(MPU_FIFO_EN_REG,0X00);	//关闭FIFO
-	mpu6050_write_reg(MPU_INTBP_CFG_REG,0X80);	//INT引脚低电平有效
-	res=mpu6050_read_reg(MPU_DEVICE_ID_REG); 
-	if(res==MPU_ADDR)//器件ID正确
-	{
-		mpu6050_write_reg(PWR_MGMT_1,0X01);	//设置CLKSEL,PLL X轴为参考
-		mpu6050_write_reg(PWR_MGMT_2,0X00);	//加速度与陀螺仪都工作
-		MPU_Set_Rate(100);						//设置采样率为50Hz
- 	}
+u8 MPU_Set_Accel_Fsr(u8 fsr)
+{
+    u8 value = (u8)(fsr << 3);
+    return mpu6050_write(MPU_ADDR, ACCEL_CONFIG, 1U, &value);
 }
- 
-//得到温度值
-//返回值:温度值(扩大了100倍)
+
+u8 MPU_Set_LPF(u16 lpf)
+{
+    u8 data;
+
+    if (lpf >= 188U) data = 1U;
+    else if (lpf >= 98U) data = 2U;
+    else if (lpf >= 42U) data = 3U;
+    else if (lpf >= 20U) data = 4U;
+    else if (lpf >= 10U) data = 5U;
+    else data = 6U;
+
+    return mpu6050_write(MPU_ADDR, MPU_CFG_REG, 1U, &data);
+}
+
+u8 MPU_Set_Rate(u16 rate)
+{
+    u8 divider;
+
+    if (rate > 1000U) rate = 1000U;
+    if (rate < 4U) rate = 4U;
+    divider = (u8)(1000U / rate - 1U);
+
+    if (mpu6050_write(MPU_ADDR, MPU_SAMPLE_RATE_REG, 1U, &divider) != 0U)
+    {
+        return 1U;
+    }
+    return MPU_Set_LPF((u16)(rate / 2U));
+}
+
+u8 MPU6050_Init(void)
+{
+    u8 value;
+
+    MPU6050_IIC_IO_Init();
+
+    value = 0x80U;
+    if (mpu6050_write(MPU_ADDR, PWR_MGMT_1, 1U, &value) != 0U) return 1U;
+    delay_ms(100U);
+
+    value = 0x00U;
+    if (mpu6050_write(MPU_ADDR, PWR_MGMT_1, 1U, &value) != 0U) return 1U;
+
+    /* Match the reference lower controller: +/-500 dps, +/-4 g, 250 Hz. */
+    if (MPU_Set_Gyro_Fsr(1U) != 0U) return 1U;
+    if (MPU_Set_Accel_Fsr(1U) != 0U) return 1U;
+    if (MPU_Set_Rate(250U) != 0U) return 1U;
+
+    value = 0x00U;
+    if (mpu6050_write(MPU_ADDR, MPU_INT_EN_REG, 1U, &value) != 0U) return 1U;
+    if (mpu6050_write(MPU_ADDR, MPU_USER_CTRL_REG, 1U, &value) != 0U) return 1U;
+    if (mpu6050_write(MPU_ADDR, MPU_FIFO_EN_REG, 1U, &value) != 0U) return 1U;
+    if (mpu6050_write(MPU_ADDR, MPU_INTBP_CFG_REG, 1U, &value) != 0U) return 1U;
+
+    if (mpu6050_read_reg(MPU_DEVICE_ID_REG) != MPU_ADDR) return 1U;
+
+    value = 0x01U;
+    if (mpu6050_write(MPU_ADDR, PWR_MGMT_1, 1U, &value) != 0U) return 1U;
+    value = 0x00U;
+    if (mpu6050_write(MPU_ADDR, PWR_MGMT_2, 1U, &value) != 0U) return 1U;
+    return 0U;
+}
+
 short MPU_Get_Temperature(void)
 {
-    u8 buf[2]; 
+    u8 buf[2];
     short raw;
-	float temp;
-	mpu6050_read(MPU_ADDR,TEMP_OUT_H,2,buf); 
-    raw=((u16)buf[0]<<8)|buf[1];  
-    temp=36.53+((double)raw)/340;  
-    return temp*100;
+
+    if (mpu6050_read(MPU_ADDR, TEMP_OUT_H, 2U, buf) != 0U) return 0;
+    raw = (short)(((u16)buf[0] << 8) | buf[1]);
+    return (short)(3653L + ((long)raw * 100L) / 340L);
 }
-//得到陀螺仪值(原始值)
-//gx,gy,gz:陀螺仪x,y,z轴的原始读数(带符号)
-//返回值:0,成功
-//    其他,错误代码
-u8 MPU_Get_Gyroscope(short *gx,short *gy,short *gz)
+
+u8 MPU_Get_Gyroscope(short *gx, short *gy, short *gz)
 {
-    u8 buf[6],res;  
-	res=mpu6050_read(MPU_ADDR,GYRO_XOUT_H,6,buf);
-	if(res==0)
-	{
-		*gx=((u16)buf[0]<<8)|buf[1];  
-		*gy=((u16)buf[2]<<8)|buf[3];  
-		*gz=((u16)buf[4]<<8)|buf[5];
-	} 	
-    return res;
+    u8 buf[6];
+    u8 result = mpu6050_read(MPU_ADDR, GYRO_XOUT_H, 6U, buf);
+
+    if (result == 0U)
+    {
+        *gx = (short)(((u16)buf[0] << 8) | buf[1]);
+        *gy = (short)(((u16)buf[2] << 8) | buf[3]);
+        *gz = (short)(((u16)buf[4] << 8) | buf[5]);
+    }
+    return result;
 }
-//得到加速度值(原始值)
-//gx,gy,gz:陀螺仪x,y,z轴的原始读数(带符号)
-//返回值:0,成功
-//    其他,错误代码
-u8 MPU_Get_Accelerometer(short *ax,short *ay,short *az)
+
+u8 MPU_Get_Accelerometer(short *ax, short *ay, short *az)
 {
-    u8 buf[6],res;  
-	res=mpu6050_read(MPU_ADDR,ACCEL_XOUT_H,6,buf);
-	if(res==0)
-	{
-		*ax=((u16)buf[0]<<8)|buf[1];  
-		*ay=((u16)buf[2]<<8)|buf[3];  
-		*az=((u16)buf[4]<<8)|buf[5];
-	} 	
-    return res;
+    u8 buf[6];
+    u8 result = mpu6050_read(MPU_ADDR, ACCEL_XOUT_H, 6U, buf);
+
+    if (result == 0U)
+    {
+        *ax = (short)(((u16)buf[0] << 8) | buf[1]);
+        *ay = (short)(((u16)buf[2] << 8) | buf[3]);
+        *az = (short)(((u16)buf[4] << 8) | buf[5]);
+    }
+    return result;
+}
+
+u8 MPU_Get_Raw6Axis(short *ax,
+                    short *ay,
+                    short *az,
+                    short *temperatureRaw,
+                    short *gx,
+                    short *gy,
+                    short *gz)
+{
+    u8 buf[14];
+    u8 result = mpu6050_read(MPU_ADDR, ACCEL_XOUT_H, 14U, buf);
+
+    if (result == 0U)
+    {
+        *ax = (short)(((u16)buf[0] << 8) | buf[1]);
+        *ay = (short)(((u16)buf[2] << 8) | buf[3]);
+        *az = (short)(((u16)buf[4] << 8) | buf[5]);
+        *temperatureRaw = (short)(((u16)buf[6] << 8) | buf[7]);
+        *gx = (short)(((u16)buf[8] << 8) | buf[9]);
+        *gy = (short)(((u16)buf[10] << 8) | buf[11]);
+        *gz = (short)(((u16)buf[12] << 8) | buf[13]);
+    }
+    return result;
 }

@@ -1,180 +1,176 @@
-#include "stm32f10x.h"                  // Device header
-#include "pwm.h"
+#include "motor.h"
+
 #include "encoder.h"
-#include "math.h"
-#include "timer.h"
+#include "pwm.h"
+#include "stm32f10x.h"
 
+#define SIN_60_F            0.8660254f
+#define ONE_OVER_SQRT3_F    0.5773503f
+#define ONE_THIRD_F         0.3333333f
 
+float v1_jisuan;
+float v2_jisuan;
+float v3_jisuan;
+float PWM1;
+float PWM2;
+float PWM3;
 
+volatile float Vx_cal;
+volatile float Vy_cal;
+volatile float W_cal;
 
-float angle_to_radian = 0.01745f;
-#define L 117		//mm
-
-extern volatile float Vy_dipan, Vx_dipan ,W;
-float v1_jisuan,v2_jisuan,v3_jisuan;
-float PWM1,PWM2,PWM3;
-
-volatile float Vx_cal,Vy_cal,W_cal;
-
-
-void motor_Init()
+static int ClampMotorCommand(int pwm)
 {
-	PWM_Init(1000 , 36);
-	TIM2_encoder_Init();
-	TIM3_encoder_Init();
-	TIM4_encoder_Init();
+    if (pwm > MOTOR_PWM_OUTPUT_LIMIT) pwm = MOTOR_PWM_OUTPUT_LIMIT;
+    if (pwm < -MOTOR_PWM_OUTPUT_LIMIT) pwm = -MOTOR_PWM_OUTPUT_LIMIT;
 
+    if ((pwm > 0) && (pwm < MOTOR_PWM_MIN_EFFECTIVE))
+    {
+        pwm = MOTOR_PWM_MIN_EFFECTIVE;
+    }
+    else if ((pwm < 0) && (pwm > -MOTOR_PWM_MIN_EFFECTIVE))
+    {
+        pwm = -MOTOR_PWM_MIN_EFFECTIVE;
+    }
 
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
-	
-	GPIO_InitTypeDef GPIO_InitStructure;
-	GPIO_InitStructure.GPIO_Mode =GPIO_Mode_Out_PP;
-	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_12 | GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15;
-	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-	GPIO_Init(GPIOB, &GPIO_InitStructure);
-	
-	GPIO_InitTypeDef GPIO_InitStructure1;
-	GPIO_InitStructure1.GPIO_Mode =GPIO_Mode_Out_PP;
-	GPIO_InitStructure1.GPIO_Pin = GPIO_Pin_10 | GPIO_Pin_11;
-	GPIO_InitStructure1.GPIO_Speed = GPIO_Speed_50MHz;
-	GPIO_Init(GPIOC, &GPIO_InitStructure1);
-	
-	
-	GPIO_ResetBits(GPIOB,GPIO_Pin_12 | GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15);
-	GPIO_ResetBits(GPIOC,GPIO_Pin_10 | GPIO_Pin_11);
+    return pwm;
 }
 
-void hou_Positive()						//后轮正转
+static float AbsFloat(float value)
 {
-	GPIO_SetBits(GPIOB,GPIO_Pin_13);
-	GPIO_ResetBits(GPIOB,GPIO_Pin_12);
+    return (value >= 0.0f) ? value : -value;
 }
 
-void hou_Negative()						//后轮反转
+void motor_Init(void)
 {
-	GPIO_SetBits(GPIOB,GPIO_Pin_12);
-	GPIO_ResetBits(GPIOB,GPIO_Pin_13);
+    GPIO_InitTypeDef gpioInit;
+
+    /* 72 MHz / (7199 + 1) = 10 kHz, with a normalized 0..1000 command. */
+    PWM_Init(7199U, 0U);
+
+    TIM2_encoder_Init();
+    TIM3_encoder_Init();
+    TIM4_encoder_Init();
+    Encoder_ResetSpeedFilter();
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+
+    gpioInit.GPIO_Mode = GPIO_Mode_Out_PP;
+    gpioInit.GPIO_Pin = GPIO_Pin_12 | GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15;
+    gpioInit.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &gpioInit);
+
+    gpioInit.GPIO_Pin = GPIO_Pin_10 | GPIO_Pin_11;
+    GPIO_Init(GPIOC, &gpioInit);
+
+    motor_StopAll();
 }
 
-
-void left_Positive()						//右轮正转
+void motor_Set1(int pwm)
 {
-	GPIO_ResetBits(GPIOC,GPIO_Pin_11);
-	GPIO_SetBits(GPIOC,GPIO_Pin_10);
+    pwm = ClampMotorCommand(pwm);
+
+    if (pwm > 0)
+    {
+        GPIO_SetBits(GPIOB, GPIO_Pin_15);
+        GPIO_ResetBits(GPIOB, GPIO_Pin_14);
+        PWM_SetCompare1((u16)pwm);
+    }
+    else if (pwm < 0)
+    {
+        GPIO_SetBits(GPIOB, GPIO_Pin_14);
+        GPIO_ResetBits(GPIOB, GPIO_Pin_15);
+        PWM_SetCompare1((u16)(-pwm));
+    }
+    else
+    {
+        PWM_SetCompare1(0U);
+        GPIO_ResetBits(GPIOB, GPIO_Pin_14 | GPIO_Pin_15);
+    }
 }
 
-void left_Negative()						//右轮反转
+void motor_Set2(int pwm)
 {
-	GPIO_ResetBits(GPIOC,GPIO_Pin_10);
-	GPIO_SetBits(GPIOC,GPIO_Pin_11);
+    pwm = ClampMotorCommand(pwm);
+
+    if (pwm > 0)
+    {
+        GPIO_ResetBits(GPIOC, GPIO_Pin_11);
+        GPIO_SetBits(GPIOC, GPIO_Pin_10);
+        PWM_SetCompare2((u16)pwm);
+    }
+    else if (pwm < 0)
+    {
+        GPIO_ResetBits(GPIOC, GPIO_Pin_10);
+        GPIO_SetBits(GPIOC, GPIO_Pin_11);
+        PWM_SetCompare2((u16)(-pwm));
+    }
+    else
+    {
+        PWM_SetCompare2(0U);
+        GPIO_ResetBits(GPIOC, GPIO_Pin_10 | GPIO_Pin_11);
+    }
 }
 
-
-void right_Positive()						//h轮正转
+void motor_Set3(int pwm)
 {
-	GPIO_SetBits(GPIOB,GPIO_Pin_15);
-	GPIO_ResetBits(GPIOB,GPIO_Pin_14);
+    pwm = ClampMotorCommand(pwm);
+
+    if (pwm > 0)
+    {
+        GPIO_SetBits(GPIOB, GPIO_Pin_13);
+        GPIO_ResetBits(GPIOB, GPIO_Pin_12);
+        PWM_SetCompare3((u16)pwm);
+    }
+    else if (pwm < 0)
+    {
+        GPIO_SetBits(GPIOB, GPIO_Pin_12);
+        GPIO_ResetBits(GPIOB, GPIO_Pin_13);
+        PWM_SetCompare3((u16)(-pwm));
+    }
+    else
+    {
+        PWM_SetCompare3(0U);
+        GPIO_ResetBits(GPIOB, GPIO_Pin_12 | GPIO_Pin_13);
+    }
 }
 
-void right_Negative()						//右轮反转
+void motor_StopAll(void)
 {
-	GPIO_SetBits(GPIOB,GPIO_Pin_14);
-	GPIO_ResetBits(GPIOB,GPIO_Pin_15);
+    motor_Set1(0);
+    motor_Set2(0);
+    motor_Set3(0);
 }
 
-
-
-void motor_Set1(int PWM)
+void Speed_Target(float vxMmps, float vyMmps, float wzRadps)
 {
-	if(PWM>1000)
-	{
-		PWM=1000;
-	}
-	else if (PWM<-1000)
-	{
-		PWM = -1000;
-	}
-	
-	
-	if(PWM > 0)			//正转
-	{
-		right_Positive();
-		PWM_SetCompare1(PWM);
-	}
-	else
-	{
-		right_Negative();
-		PWM_SetCompare1(-PWM);
-	}
+    float maxMagnitude;
+    float scale;
+
+    /* Three-wheel omni kinematics; keep the user's chassis geometry. */
+    v1_jisuan = 0.5f * vyMmps + SIN_60_F * vxMmps + wzRadps * CHASSIS_CENTER_TO_WHEEL_MM;
+    v2_jisuan = 0.5f * vyMmps - SIN_60_F * vxMmps + wzRadps * CHASSIS_CENTER_TO_WHEEL_MM;
+    v3_jisuan = -vyMmps + wzRadps * CHASSIS_CENTER_TO_WHEEL_MM;
+
+    /* Scale all wheels together so the commanded chassis direction is preserved. */
+    maxMagnitude = AbsFloat(v1_jisuan);
+    if (AbsFloat(v2_jisuan) > maxMagnitude) maxMagnitude = AbsFloat(v2_jisuan);
+    if (AbsFloat(v3_jisuan) > maxMagnitude) maxMagnitude = AbsFloat(v3_jisuan);
+
+    if (maxMagnitude > MOTOR_WHEEL_SPEED_LIMIT_MMPS)
+    {
+        scale = MOTOR_WHEEL_SPEED_LIMIT_MMPS / maxMagnitude;
+        v1_jisuan *= scale;
+        v2_jisuan *= scale;
+        v3_jisuan *= scale;
+    }
 }
 
-void motor_Set2(int PWM)
+void Speed_cal(float v1Actual, float v2Actual, float v3Actual)
 {
-	if(PWM>1000)
-	{
-		PWM=1000;
-	}
-	else if (PWM<-1000)
-	{
-		PWM = -1000;
-	}
-	
-	
-	if(PWM > 0)			//正转
-	{
-		left_Positive();
-		PWM_SetCompare2(PWM);
-	}
-	else
-	{
-		left_Negative();
-		PWM_SetCompare2(-PWM);
-	}
+    Vx_cal = (v1Actual - v2Actual) * ONE_OVER_SQRT3_F;
+    Vy_cal = (v1Actual + v2Actual - 2.0f * v3Actual) * ONE_THIRD_F;
+    W_cal = (v1Actual + v2Actual + v3Actual) *
+            (ONE_THIRD_F / CHASSIS_CENTER_TO_WHEEL_MM);
 }
-
-
-void motor_Set3(int PWM)
-{
-	if(PWM>1000)
-	{
-		PWM=1000;
-	}
-	else if (PWM<-1000)
-	{
-		PWM = -1000;
-	}
-	
-	
-	if(PWM > 0)			//正转
-	{
-		hou_Positive();
-		PWM_SetCompare3(PWM);
-	}
-	else
-	{
-		hou_Negative();
-		PWM_SetCompare3(-PWM);
-	}
-}
-
-void Speed_Target(float Vx_dipan ,float Vy_dipan, float W)  
-{
-	v1_jisuan = -cos(60 * angle_to_radian) *(-Vy_dipan) + sin(60 * angle_to_radian) *Vx_dipan + W*L;
-	v2_jisuan = -cos(60 * angle_to_radian) * ( -Vy_dipan) - sin(60 * angle_to_radian) *Vx_dipan + W*L;
-	v3_jisuan =  ( -Vy_dipan) + W*L;
-}
-
-void Speed_cal(float v1_actual ,float v2_actual, float v3_actual) 
-{
-	Vx_cal = (v1_actual - v2_actual) * sqrt(3)/3;
-	Vy_cal = v1_actual/3 + v2_actual/3 - v3_actual*2/3;
-	W_cal = (v1_actual/3 + v2_actual/3 + v3_actual/3)/L;
-}
-
-
-
-
-
-
-

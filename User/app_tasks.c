@@ -4,35 +4,49 @@
 #include "queue.h"
 #include "task.h"
 
+#include "delay.h"
 #include "encoder.h"
 #include "motor.h"
+#include "mpu6050.h"
 #include "my_robot_usart.h"
 #include "OLED.h"
 #include "pid.h"
 
-#define CONTROL_PERIOD_MS       5U
-#define ROS_TX_PERIOD_MS        20U
-#define DISPLAY_PERIOD_MS       100U
-#define SAFETY_PERIOD_MS        20U
-#define ROS_CMD_TIMEOUT_MS      300U
+#define CONTROL_PERIOD_MS              5U
+#define CONTROL_DT_S                   0.005f
+#define ROS_TX_PERIOD_MS               20U
+#define DISPLAY_PERIOD_MS              100U
+#define SAFETY_PERIOD_MS               20U
+#define IMU_PERIOD_MS                  4U
+#define ROS_CMD_TIMEOUT_MS             300U
 
-#define ROS_RX_QUEUE_LENGTH     256U
+#define ROS_RX_QUEUE_LENGTH            256U
 
-#define WHEEL_RADIUS_M          0.029f
-#define ENCODER_LINE_COUNT      13.0f
-#define MOTOR_REDUCTION_RATIO   74.8f
-#define PI_F                    3.1416f
+#define WHEEL_ACCELERATION_MMPS2       500.0f
+#define WHEEL_DECELERATION_MMPS2       1000.0f
+#define WHEEL_SPEED_FEEDFORWARD_GAIN   1.24f
+#define WHEEL_ZERO_EPSILON_MMPS        0.01f
+#define REVERSAL_ZERO_HOLD_MS          20U
 
-#define SPEED_FILTER_LOW_THRESHOLD_MMPS 180.0f
-#define SPEED_FILTER_LOW_ALPHA          0.25f
-#define SPEED_FILTER_HIGH_ALPHA         0.65f
-#define SPEED_FILTER_ZERO_THRESHOLD_MMPS 1.0f
+#define IMU_GYRO_CALIBRATION_SAMPLES   200U
+#define IMU_GYRO_CALIBRATION_MIN_OK    180U
 
-#define CONTROL_TASK_PRIORITY   5U
-#define ROS_RX_TASK_PRIORITY    4U
-#define SAFETY_TASK_PRIORITY    4U
-#define ROS_TX_TASK_PRIORITY    2U
-#define DISPLAY_TASK_PRIORITY   1U
+#define CONTROL_TASK_PRIORITY          5U
+#define ROS_RX_TASK_PRIORITY           4U
+#define SAFETY_TASK_PRIORITY           4U
+#define IMU_TASK_PRIORITY              3U
+#define ROS_TX_TASK_PRIORITY           2U
+#define DISPLAY_TASK_PRIORITY          1U
+
+typedef struct
+{
+    PID *pid;
+    float commandTarget;
+    float rampedTarget;
+    float pendingTarget;
+    uint16_t zeroHoldTicks;
+    uint8_t reversing;
+} WheelControl;
 
 extern PID mypid1, mypid2, mypid3;
 extern int KeyNum1, KeyNum2, KeyNum3;
@@ -52,44 +66,124 @@ extern short testSend4;
 extern unsigned char testSend5;
 extern unsigned char testRece4;
 
+volatile uint8_t g_imuReady;
+volatile int16_t g_imuAccelX;
+volatile int16_t g_imuAccelY;
+volatile int16_t g_imuAccelZ;
+volatile int16_t g_imuGyroX;
+volatile int16_t g_imuGyroY;
+volatile int16_t g_imuGyroZ;
+volatile int16_t g_imuTemperatureCentiDeg;
+volatile uint32_t g_imuSampleCount;
+volatile uint32_t g_imuReadErrorCount;
+
+static long s_gyroBiasX;
+static long s_gyroBiasY;
+static long s_gyroBiasZ;
+
 static QueueHandle_t s_rosRxQueue;
 static volatile TickType_t s_lastRosCmdTick;
 static volatile uint8_t s_rosTimeout;
 static volatile AppCmdSource s_cmdSource = APP_CMD_SOURCE_NONE;
-static float s_filteredWheelSpeed1;
-static float s_filteredWheelSpeed2;
-static float s_filteredWheelSpeed3;
+
+static WheelControl s_wheel[3];
 
 static void ControlTask(void *argument);
 static void RosRxTask(void *argument);
 static void RosTxTask(void *argument);
 static void DisplayTask(void *argument);
 static void SafetyTask(void *argument);
-static float EncoderCountToSpeedMmps(int16_t count, float sampleTimeSec);
+static void ImuTask(void *argument);
+
 static float AbsFloat(float value);
-static float WheelSpeedFilterUpdate(float filteredSpeed, float rawSpeed, float targetSpeed);
-static void WheelSpeedFilterReset(void);
+static uint8_t OppositeSigns(float first, float second);
+static float SlewRateLimit(float current, float target);
+static void WheelControlInit(void);
+static void WheelControlSetTarget(WheelControl *wheel, float target);
+static int WheelControlUpdate(WheelControl *wheel, float feedback);
+static void WheelControlReset(WheelControl *wheel);
 static void MotorStopAndResetPid(void);
+static int RoundFloatToInt(float value);
+
+uint8_t App_IMU_Prepare(void)
+{
+    unsigned int i;
+    unsigned int validSamples = 0U;
+    long sumX = 0L;
+    long sumY = 0L;
+    long sumZ = 0L;
+    short ax;
+    short ay;
+    short az;
+    short temperatureRaw;
+    short gx;
+    short gy;
+    short gz;
+
+    g_imuReady = 0U;
+    g_imuSampleCount = 0U;
+    g_imuReadErrorCount = 0U;
+
+    if (MPU6050_Init() != 0U)
+    {
+        return 0U;
+    }
+
+    /* The chassis must remain stationary during this approximately 0.8 s step. */
+    for (i = 0U; i < IMU_GYRO_CALIBRATION_SAMPLES; i++)
+    {
+        if (MPU_Get_Raw6Axis(&ax, &ay, &az, &temperatureRaw, &gx, &gy, &gz) == 0U)
+        {
+            sumX += gx;
+            sumY += gy;
+            sumZ += gz;
+            validSamples++;
+        }
+        delay_ms(IMU_PERIOD_MS);
+    }
+
+    if (validSamples < IMU_GYRO_CALIBRATION_MIN_OK)
+    {
+        return 0U;
+    }
+
+    s_gyroBiasX = sumX / (long)validSamples;
+    s_gyroBiasY = sumY / (long)validSamples;
+    s_gyroBiasZ = sumZ / (long)validSamples;
+    g_imuReady = 1U;
+    return 1U;
+}
 
 void App_CreateTasks(void)
 {
+    BaseType_t createResult = pdPASS;
+
+    WheelControlInit();
+
     s_rosRxQueue = xQueueCreate(ROS_RX_QUEUE_LENGTH, sizeof(uint8_t));
     if (s_rosRxQueue == NULL)
     {
-        while (1)
-        {
-        }
+        motor_StopAll();
+        while (1) { }
     }
 
-    /*
-     * ControlTask owns the motor PWM output. Other tasks only update command
-     * state, so motor writes have one clear owner and the 5 ms loop stays stable.
-     */
-    xTaskCreate(ControlTask, "control", 256, NULL, CONTROL_TASK_PRIORITY, NULL);
-    xTaskCreate(RosRxTask, "ros_rx", 256, NULL, ROS_RX_TASK_PRIORITY, NULL);
-    xTaskCreate(SafetyTask, "safety", 160, NULL, SAFETY_TASK_PRIORITY, NULL);
-    xTaskCreate(RosTxTask, "ros_tx", 192, NULL, ROS_TX_TASK_PRIORITY, NULL);
-    xTaskCreate(DisplayTask, "display", 192, NULL, DISPLAY_TASK_PRIORITY, NULL);
+    /* ControlTask is the only owner of normal PWM writes. */
+    if (xTaskCreate(ControlTask, "control", 256, NULL, CONTROL_TASK_PRIORITY, NULL) != pdPASS) createResult = pdFAIL;
+    if (xTaskCreate(RosRxTask, "ros_rx", 256, NULL, ROS_RX_TASK_PRIORITY, NULL) != pdPASS) createResult = pdFAIL;
+    if (xTaskCreate(SafetyTask, "safety", 160, NULL, SAFETY_TASK_PRIORITY, NULL) != pdPASS) createResult = pdFAIL;
+    if (xTaskCreate(RosTxTask, "ros_tx", 192, NULL, ROS_TX_TASK_PRIORITY, NULL) != pdPASS) createResult = pdFAIL;
+    if (xTaskCreate(DisplayTask, "display", 192, NULL, DISPLAY_TASK_PRIORITY, NULL) != pdPASS) createResult = pdFAIL;
+
+    if (g_imuReady != 0U)
+    {
+        if (xTaskCreate(ImuTask, "imu", 256, NULL, IMU_TASK_PRIORITY, NULL) != pdPASS) createResult = pdFAIL;
+    }
+
+    if (createResult != pdPASS)
+    {
+        motor_StopAll();
+        while (1) { }
+    }
 }
 
 void App_RosRxByteFromISR(uint8_t byte)
@@ -99,16 +193,16 @@ void App_RosRxByteFromISR(uint8_t byte)
 
 void App_RosRxBufferFromISR(const uint8_t *data, uint16_t length)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    BaseType_t higherPriorityTaskWoken = pdFALSE;
     uint16_t i;
 
     if ((s_rosRxQueue != NULL) && (data != NULL))
     {
-        for (i = 0; i < length; i++)
+        for (i = 0U; i < length; i++)
         {
-            (void)xQueueSendFromISR(s_rosRxQueue, &data[i], &xHigherPriorityTaskWoken);
+            (void)xQueueSendFromISR(s_rosRxQueue, &data[i], &higherPriorityTaskWoken);
         }
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(higherPriorityTaskWoken);
     }
 }
 
@@ -123,20 +217,30 @@ static void ControlTask(void *argument)
         float vxTarget;
         float vyTarget;
         float wzTarget;
-        float rawSpeed1;
-        float rawSpeed2;
-        float rawSpeed3;
         uint8_t stopNow;
+        int16_t delta1;
+        int16_t delta2;
+        int16_t delta3;
+        float measured1;
+        float measured2;
+        float measured3;
 
         vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(CONTROL_PERIOD_MS));
 
-        speed_capture1 = TIM2_Encoder_Get();
-        speed_capture2 = TIM3_Encoder_Get();
-        speed_capture3 = TIM4_Encoder_Get();
+        Encoder_Sample5ms(&delta1,
+                          &delta2,
+                          &delta3,
+                          &measured1,
+                          &measured2,
+                          &measured3);
+        speed_actual1 = measured1;
+        speed_actual2 = measured2;
+        speed_actual3 = measured3;
+        speed_capture1 = (float)delta1;
+        speed_capture2 = (float)delta2;
+        speed_capture3 = (float)delta3;
 
-        rawSpeed1 = EncoderCountToSpeedMmps((int16_t)speed_capture1, CONTROL_PERIOD_MS / 1000.0f);
-        rawSpeed2 = EncoderCountToSpeedMmps((int16_t)speed_capture2, CONTROL_PERIOD_MS / 1000.0f);
-        rawSpeed3 = EncoderCountToSpeedMmps((int16_t)speed_capture3, CONTROL_PERIOD_MS / 1000.0f);
+        Speed_cal(speed_actual1, speed_actual2, speed_actual3);
 
         taskENTER_CRITICAL();
         if (flag == 1)
@@ -146,16 +250,16 @@ static void ControlTask(void *argument)
             W = 0.01f * (float)w;
             flag = 0;
             s_cmdSource = APP_CMD_SOURCE_BT;
-            s_rosTimeout = 0;
+            s_rosTimeout = 0U;
         }
 
-        stopNow = (uint8_t)((flag_stop == 1) || (s_rosTimeout != 0));
+        stopNow = (uint8_t)((flag_stop == 1) || (s_rosTimeout != 0U));
         vxTarget = Vx_dipan;
         vyTarget = Vy_dipan;
         wzTarget = W;
         taskEXIT_CRITICAL();
 
-        if (stopNow)
+        if (stopNow != 0U)
         {
             taskENTER_CRITICAL();
             Vx_dipan = 0.0f;
@@ -163,30 +267,19 @@ static void ControlTask(void *argument)
             W = 0.0f;
             taskEXIT_CRITICAL();
 
+            /* Emergency/timeout stop deliberately bypasses the target ramp. */
             MotorStopAndResetPid();
             continue;
         }
 
         Speed_Target(vxTarget, vyTarget, wzTarget);
+        WheelControlSetTarget(&s_wheel[0], v1_jisuan);
+        WheelControlSetTarget(&s_wheel[1], v2_jisuan);
+        WheelControlSetTarget(&s_wheel[2], v3_jisuan);
 
-        s_filteredWheelSpeed1 = WheelSpeedFilterUpdate(s_filteredWheelSpeed1, rawSpeed1, v1_jisuan);
-        s_filteredWheelSpeed2 = WheelSpeedFilterUpdate(s_filteredWheelSpeed2, rawSpeed2, v2_jisuan);
-        s_filteredWheelSpeed3 = WheelSpeedFilterUpdate(s_filteredWheelSpeed3, rawSpeed3, v3_jisuan);
-
-        speed_actual1 = s_filteredWheelSpeed1;
-        speed_actual2 = s_filteredWheelSpeed2;
-        speed_actual3 = s_filteredWheelSpeed3;
-
-        Speed_cal(speed_actual1, speed_actual2, speed_actual3);
-
-        PID_Calc(&mypid1, v1_jisuan, speed_actual1);
-        KeyNum1 = (int)mypid1.output;
-
-        PID_Calc(&mypid2, v2_jisuan, speed_actual2);
-        KeyNum2 = (int)mypid2.output;
-
-        PID_Calc(&mypid3, v3_jisuan, speed_actual3);
-        KeyNum3 = (int)mypid3.output;
+        KeyNum1 = WheelControlUpdate(&s_wheel[0], speed_actual1);
+        KeyNum2 = WheelControlUpdate(&s_wheel[1], speed_actual2);
+        KeyNum3 = WheelControlUpdate(&s_wheel[2], speed_actual3);
 
         motor_Set1(KeyNum1);
         motor_Set2(KeyNum2);
@@ -216,7 +309,7 @@ static void RosRxTask(void *argument)
                 W = (float)wzReceive / 1000.0f;
                 testRece4 = ctrlFlag;
                 s_lastRosCmdTick = xTaskGetTickCount();
-                s_rosTimeout = 0;
+                s_rosTimeout = 0U;
                 s_cmdSource = APP_CMD_SOURCE_ROS;
                 taskEXIT_CRITICAL();
             }
@@ -277,7 +370,6 @@ static void DisplayTask(void *argument)
         OLED_ShowSignedNum(1, 1, (int)wheel1, 4);
         OLED_ShowSignedNum(2, 1, (int)wheel3, 4);
         OLED_ShowSignedNum(1, 7, (int)wheel2, 4);
-
         OLED_ShowSignedNum(3, 7, (int)vy, 4);
         OLED_ShowSignedNum(3, 1, (int)vx, 4);
         OLED_ShowSignedNum(4, 1, (int)(wz * 100.0f), 4);
@@ -309,7 +401,7 @@ static void SafetyTask(void *argument)
             ((now - lastRos) > pdMS_TO_TICKS(ROS_CMD_TIMEOUT_MS)))
         {
             taskENTER_CRITICAL();
-            s_rosTimeout = 1;
+            s_rosTimeout = 1U;
             Vx_dipan = 0.0f;
             Vy_dipan = 0.0f;
             W = 0.0f;
@@ -318,12 +410,45 @@ static void SafetyTask(void *argument)
     }
 }
 
-static float EncoderCountToSpeedMmps(int16_t count, float sampleTimeSec)
+static void ImuTask(void *argument)
 {
-    float countsPerRev = ENCODER_LINE_COUNT * MOTOR_REDUCTION_RATIO;
-    float wheelCircumferenceM = 2.0f * PI_F * WHEEL_RADIUS_M;
+    TickType_t lastWakeTime = xTaskGetTickCount();
 
-    return ((float)count / sampleTimeSec) / countsPerRev * wheelCircumferenceM * 1000.0f;
+    (void)argument;
+
+    for (;;)
+    {
+        short ax;
+        short ay;
+        short az;
+        short temperatureRaw;
+        short gx;
+        short gy;
+        short gz;
+
+        vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(IMU_PERIOD_MS));
+
+        if (MPU_Get_Raw6Axis(&ax, &ay, &az, &temperatureRaw, &gx, &gy, &gz) == 0U)
+        {
+            taskENTER_CRITICAL();
+            g_imuAccelX = ax;
+            g_imuAccelY = ay;
+            g_imuAccelZ = az;
+            g_imuGyroX = (short)((long)gx - s_gyroBiasX);
+            g_imuGyroY = (short)((long)gy - s_gyroBiasY);
+            g_imuGyroZ = (short)((long)gz - s_gyroBiasZ);
+            g_imuTemperatureCentiDeg =
+                (short)(3653L + ((long)temperatureRaw * 100L) / 340L);
+            g_imuSampleCount++;
+            taskEXIT_CRITICAL();
+        }
+        else
+        {
+            taskENTER_CRITICAL();
+            g_imuReadErrorCount++;
+            taskEXIT_CRITICAL();
+        }
+    }
 }
 
 static float AbsFloat(float value)
@@ -331,52 +456,127 @@ static float AbsFloat(float value)
     return (value >= 0.0f) ? value : -value;
 }
 
-static float WheelSpeedFilterUpdate(float filteredSpeed, float rawSpeed, float targetSpeed)
+static uint8_t OppositeSigns(float first, float second)
 {
-    float rawAbs = AbsFloat(rawSpeed);
-    float targetAbs = AbsFloat(targetSpeed);
-    float alpha = SPEED_FILTER_HIGH_ALPHA;
-
-    if ((rawAbs < SPEED_FILTER_ZERO_THRESHOLD_MMPS) &&
-        (targetAbs < SPEED_FILTER_ZERO_THRESHOLD_MMPS))
-    {
-        return 0.0f;
-    }
-
-    if ((rawAbs < SPEED_FILTER_LOW_THRESHOLD_MMPS) &&
-        (targetAbs < SPEED_FILTER_LOW_THRESHOLD_MMPS))
-    {
-        alpha = SPEED_FILTER_LOW_ALPHA;
-    }
-
-    return filteredSpeed + alpha * (rawSpeed - filteredSpeed);
+    return (uint8_t)(((first > WHEEL_ZERO_EPSILON_MMPS) &&
+                      (second < -WHEEL_ZERO_EPSILON_MMPS)) ||
+                     ((first < -WHEEL_ZERO_EPSILON_MMPS) &&
+                      (second > WHEEL_ZERO_EPSILON_MMPS)));
 }
 
-static void WheelSpeedFilterReset(void)
+static float SlewRateLimit(float current, float target)
 {
-    s_filteredWheelSpeed1 = 0.0f;
-    s_filteredWheelSpeed2 = 0.0f;
-    s_filteredWheelSpeed3 = 0.0f;
+    float rate;
+    float maximumStep;
+    float difference = target - current;
+    uint8_t accelerating;
 
-    speed_actual1 = 0.0f;
-    speed_actual2 = 0.0f;
-    speed_actual3 = 0.0f;
-    Speed_cal(0.0f, 0.0f, 0.0f);
+    accelerating = (uint8_t)(((AbsFloat(current) <= WHEEL_ZERO_EPSILON_MMPS) &&
+                              (AbsFloat(target) > WHEEL_ZERO_EPSILON_MMPS)) ||
+                             ((!OppositeSigns(current, target)) &&
+                              (AbsFloat(target) > AbsFloat(current))));
+
+    rate = (accelerating != 0U) ? WHEEL_ACCELERATION_MMPS2 :
+                                  WHEEL_DECELERATION_MMPS2;
+    maximumStep = rate * CONTROL_DT_S;
+
+    if (difference > maximumStep) return current + maximumStep;
+    if (difference < -maximumStep) return current - maximumStep;
+    return target;
+}
+
+static void WheelControlInit(void)
+{
+    s_wheel[0].pid = &mypid1;
+    s_wheel[1].pid = &mypid2;
+    s_wheel[2].pid = &mypid3;
+    WheelControlReset(&s_wheel[0]);
+    WheelControlReset(&s_wheel[1]);
+    WheelControlReset(&s_wheel[2]);
+}
+
+static void WheelControlSetTarget(WheelControl *wheel, float target)
+{
+    if (wheel->reversing != 0U)
+    {
+        wheel->pendingTarget = target;
+        return;
+    }
+
+    if (OppositeSigns(wheel->rampedTarget, target) != 0U)
+    {
+        wheel->reversing = 1U;
+        wheel->pendingTarget = target;
+        wheel->zeroHoldTicks = REVERSAL_ZERO_HOLD_MS / CONTROL_PERIOD_MS;
+        return;
+    }
+
+    wheel->commandTarget = target;
+}
+
+static int WheelControlUpdate(WheelControl *wheel, float feedback)
+{
+    float activeTarget;
+    float feedforward;
+    float output;
+
+    activeTarget = (wheel->reversing != 0U) ? 0.0f : wheel->commandTarget;
+    wheel->rampedTarget = SlewRateLimit(wheel->rampedTarget, activeTarget);
+
+    if ((wheel->reversing != 0U) &&
+        (AbsFloat(wheel->rampedTarget) <= WHEEL_ZERO_EPSILON_MMPS))
+    {
+        wheel->rampedTarget = 0.0f;
+        PID_Reset(wheel->pid);
+
+        if (wheel->zeroHoldTicks > 0U)
+        {
+            wheel->zeroHoldTicks--;
+            return 0;
+        }
+
+        wheel->reversing = 0U;
+        wheel->commandTarget = wheel->pendingTarget;
+        return 0;
+    }
+
+    if ((wheel->reversing == 0U) &&
+        (AbsFloat(wheel->commandTarget) <= WHEEL_ZERO_EPSILON_MMPS) &&
+        (AbsFloat(wheel->rampedTarget) <= WHEEL_ZERO_EPSILON_MMPS))
+    {
+        wheel->rampedTarget = 0.0f;
+        PID_Reset(wheel->pid);
+        return 0;
+    }
+
+    feedforward = WHEEL_SPEED_FEEDFORWARD_GAIN * wheel->rampedTarget;
+    output = feedforward +
+             PID_Calc(wheel->pid, wheel->rampedTarget, feedback, CONTROL_DT_S);
+    return RoundFloatToInt(output);
+}
+
+static void WheelControlReset(WheelControl *wheel)
+{
+    wheel->commandTarget = 0.0f;
+    wheel->rampedTarget = 0.0f;
+    wheel->pendingTarget = 0.0f;
+    wheel->zeroHoldTicks = 0U;
+    wheel->reversing = 0U;
+    PID_Reset(wheel->pid);
 }
 
 static void MotorStopAndResetPid(void)
 {
-    motor_Set1(0);
-    motor_Set2(0);
-    motor_Set3(0);
-
+    motor_StopAll();
     KeyNum1 = 0;
     KeyNum2 = 0;
     KeyNum3 = 0;
+    WheelControlReset(&s_wheel[0]);
+    WheelControlReset(&s_wheel[1]);
+    WheelControlReset(&s_wheel[2]);
+}
 
-    PID_Reset(&mypid1);
-    PID_Reset(&mypid2);
-    PID_Reset(&mypid3);
-
-    WheelSpeedFilterReset();
+static int RoundFloatToInt(float value)
+{
+    return (value >= 0.0f) ? (int)(value + 0.5f) : (int)(value - 0.5f);
 }
