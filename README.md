@@ -9,9 +9,11 @@
 ## 可以学到什么
 
 - 三轮全向底盘的正逆运动学解算
-- 编码器测速与三路电机速度闭环
-- PID 控制器的基本实现与积分限幅
+- 5 ms 编码器差分采样与 10 ms 滑动窗口测速
+- 速度前馈、带 dt 的抗饱和 PID 与三路电机闭环
+- 目标速度斜坡、换向关断和轮速同比例限幅
 - FreeRTOS 下的周期任务划分
+- MPU6050 原始数据采集与上电零偏标定
 - STM32 USART + DMA + IDLE 空闲中断接收
 - STM32 DMA 非阻塞串口发送
 - ROS 指令超时后的自动停车保护
@@ -82,6 +84,7 @@ Vx / Vy / W 底盘目标速度
 | ROS 串口 USART3 TX / RX | PB10 / PB11 | `Hardware/USART3.c` |
 | 蓝牙串口 USART2 TX / RX | PA2 / PA3 | `Hardware/lanya.c` |
 | OLED SCL / SDA | PB8 / PB9 | `Hardware/OLED.c` |
+| MPU6050 SCL / SDA | PC0 / PC1 | `Hardware/Mpu6050/MPU6050_I2C.c` |
 
 ## FreeRTOS 任务设计
 
@@ -92,12 +95,13 @@ Vx / Vy / W 底盘目标速度
 | `ControlTask` | 5 ms，200 Hz | 读取编码器、计算实际轮速、运动学解算、PID 计算、输出 PWM |
 | `RosRxTask` | 串口数据触发 | 从队列中取出 USART3 数据并解析 ROS 指令 |
 | `SafetyTask` | 20 ms，50 Hz | 检查 ROS 指令是否超时 |
+| `ImuTask` | 4 ms，250 Hz | 读取 MPU6050 原始数据并维护采样状态 |
 | `RosTxTask` | 20 ms，50 Hz | 向 ROS 上位机回传底盘实际速度 |
 | `DisplayTask` | 100 ms，10 Hz | 在 OLED 上显示轮速和底盘速度 |
 
 当控制源为 ROS 且超过 300 ms 没有收到新指令时，`SafetyTask` 会清零目标速度。随后 `ControlTask` 停止电机并重置 PID，避免恢复通信时积分残留导致电机突然动作。
 
-更详细的 RTOS 改造说明见 [`RTOS_MIGRATION_NOTES.md`](RTOS_MIGRATION_NOTES.md)。
+更详细的 RTOS 改造说明见 [`RTOS_MIGRATION_NOTES.md`](RTOS_MIGRATION_NOTES.md)。本轮控制升级的参数、设计取舍、接线和编译结果见 [`下位机控制改进记录.md`](下位机控制改进记录.md)。
 
 ## 目录结构
 
@@ -112,6 +116,7 @@ ros-robot/
 │   ├── pwm.c                  # TIM1 三路 PWM
 │   ├── encoder.c              # TIM2 / TIM3 / TIM4 编码器接口
 │   ├── pid.c                  # PID 控制器
+│   ├── Mpu6050/               # PC0/PC1 软件 I²C 与 MPU6050 驱动
 │   ├── USART3.c               # ROS 串口 DMA 收发
 │   ├── my_robot_usart.c       # ROS 通信协议打包与解析
 │   ├── lanya.c                # USART2 蓝牙调试控制
@@ -122,6 +127,7 @@ ros-robot/
 ├── start/                     # CMSIS 与 STM32 启动文件
 ├── System/                    # 延时、系统与基础串口代码
 ├── RTOS_MIGRATION_NOTES.md    # RTOS 化改造记录
+├── 下位机控制改进记录.md       # 控制升级参数、保护逻辑与验证记录
 └── STM32 工程模版.uvprojx      # Keil 工程文件
 ```
 
@@ -197,7 +203,8 @@ USART3 接收使用 DMA 环形缓冲区和 IDLE 空闲中断。中断只负责�
 - 补充 ROS 上位机节点，实现 `cmd_vel` 下发和里程计发布
 - 将蓝牙 USART2 接收也改造成队列 + 独立任务
 - 将底盘命令封装成结构体，减少全局变量
-- 增加 IMU 独立任务并融合 MPU6050 数据
+- 根据实车数据分别标定三路前馈系数并整定 PID
+- 确认 IMU 安装坐标系后，将原始数据接入姿态融合
 - 增加看门狗、通信丢帧统计和协议帧序号
 - 增加接线图、底盘实物图和运行演示
 

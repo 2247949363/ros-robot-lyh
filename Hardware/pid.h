@@ -3,19 +3,24 @@
 
 typedef struct
 {
-	float kp,ki,kd;
-	float error,last_error;
-	float integral, max_Integral;		
-	float output, maxOutput;			
-}PID;
+    float kp;
+    float ki;
+    float kd;
+    float error;
+    float last_error;
+    float integral;
+    float max_Integral;
+    float output;
+    float maxOutput;
+    float integral_separation;
+    float error_deadzone;
+} PID;
 
-
-void PID_Init(PID *pid,float p, float i, float d, float maxI, float maxOut);
+void PID_Init(PID *pid, float p, float i, float d, float maxI, float maxOut);
+void PID_SetProtection(PID *pid, float integralSeparation, float errorDeadzone);
 void PID_Reset(PID *pid);
 
-void PID_Calc(PID *pid, float Reference ,float feedback);
-
-int PD_jiao(float expect,float error);
-int PD_pian(float expect,float error);
+/* dt is seconds. The result is also stored in pid->output. */
+float PID_Calc(PID *pid, float reference, float feedback, float dt);
 
 #endif

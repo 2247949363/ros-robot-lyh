@@ -37,12 +37,10 @@ extern int flag_tiao;
 extern volatile int flag_stop;
 int jiao, pian;
 
-float Kp = 0.02f, Ki = 0.3f, Kd = 0.2f, Iout = 1800.0f, Out = 1000.0f;
+/* Initial speed-loop parameters copied from the proven reference controller. */
+float Kp = 4.0f, Ki = 5.0f, Kd = 0.01f, Iout = 50.0f, Out = 1000.0f;
 
 float Pitch, Roll, Yaw;
-
-u8 MPU_Get_Gyroscope(short *gx, short *gy, short *gz);
-u8 MPU_Get_Accelerometer(short *ax, short *ay, short *az);
 
 volatile int16_t second;
 
@@ -70,9 +68,8 @@ int main(void)
     motor_Init();
     USART2_Config();
 
-    /* TIM8 is no longer used for speed sampling. ControlTask runs every 5 ms. */
-    /* MPU6050_Init(); */
-    /* MPU6050_DMP_Init(); */
+    /* MPU6050: PC0=SCL, PC1=SDA; 250 Hz raw sampling after startup calibration. */
+    (void)App_IMU_Prepare();
 
     PID_Init(&mypid1, Kp, Ki, Kd, Iout, Out);
     PID_Init(&mypid2, Kp, Ki, Kd, Iout, Out);
@@ -126,4 +123,3 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
     {
     }
 }
-
